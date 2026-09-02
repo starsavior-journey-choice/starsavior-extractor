@@ -13,7 +13,7 @@ from .asset_extractor import AssetExtractor
 
 
 GAME_PROCESS_NAME = "StarSavior.exe"
-GAME_DATA_DIR = r"C:\Program Files (x86)\Steam\steamapps\common\StarSavior\Data"
+GAME_DATA_DIR = r"/mnt/c/Program Files (x86)/Steam/steamapps/common/StarSavior/Data"
 BUNDLE_DIR = str(Path(GAME_DATA_DIR) / "eb")
 CATALOG_PATH = str(Path(GAME_DATA_DIR) / "StreamingAssets" / "aa" / "catalog.json")
 DEFAULT_OUTPUT_DIR = r"D:\starsavior-extractor\output"

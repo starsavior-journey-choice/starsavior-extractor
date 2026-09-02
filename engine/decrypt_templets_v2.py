@@ -17,8 +17,8 @@ from pathlib import Path
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 TEMPLET_MAGIC = 0x2B21DE00  # Correct magic: 0x2B21DE00 (723639808 & 0xFFFFFF00)
-DECRYPTED_BUNDLES_DIR = Path(r"D:\starsavior-extractor\output\decrypted")
-OUTPUT_DIR = Path(r"D:\starsavior-extractor\output\decrypted_templets")
+DECRYPTED_BUNDLES_DIR = Path(r"./output/decrypted")
+OUTPUT_DIR = Path(r"./output/decrypted_templets")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 

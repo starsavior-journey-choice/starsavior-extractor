@@ -223,6 +223,13 @@ def main():
     parser.add_argument(
         "--force", action="store_true", help="Re-process existing files"
     )
+    parser.add_argument(
+        "--allow-failures", action="store_true",
+        help="Report failed templets but exit 0. Use only when you have "
+             "confirmed the failing files are not needed (e.g. one cutscene). "
+             "A failing STRING_COMMON must never be allowed through — every "
+             "name in the site becomes an empty string.",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.output) if args.output else OUTPUT_DIR
@@ -322,7 +329,10 @@ def main():
         print(f"{'=' * 70}")
         print("  These templets are absent from the output. The converter reads")
         print("  only *.json, so they would silently be empty.")
-        print("  Aborting with exit code 1.")
+        if args.allow_failures:
+            print("  --allow-failures given: exiting 0 anyway.")
+            return 0
+        print("  Aborting with exit code 1.  (--allow-failures to override)")
         return 1
     return 0
 

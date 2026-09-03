@@ -429,6 +429,33 @@ def cmd_catalog(args):
         print(json.dumps(cat.summary(), indent=2))
 
 
+def _fail_if_any(**counts):
+    """실패 건수가 있으면 1 을 돌려준다(= 종료 코드 1).
+
+    번들 하나가 안 풀리면 그 안의 templet 이 통째로 사라지고, 변환기는 그
+    사실을 모른 채 옛 JSON 을 그대로 남긴다. 성공으로 끝내면 배포까지 간다.
+    그래서 "몇 개 실패" 는 경고가 아니라 중단 사유다.
+
+    의도적으로 넘기려면 ALLOW_EXTRACT_FAILURES=1 을 준다.
+    """
+    bad = {k: v for k, v in counts.items() if v}
+    if not bad:
+        return 0
+    detail = ", ".join(f"{k}={v}" for k, v in sorted(bad.items()))
+    print()
+    print("=" * 70)
+    print(f"  FAILED: {detail}")
+    print("  A bundle that fails to decrypt takes its templets with it, and the")
+    print("  converter cannot tell the difference from 'this data never existed'.")
+    if os.environ.get("ALLOW_EXTRACT_FAILURES") == "1":
+        print("  ALLOW_EXTRACT_FAILURES=1 set: exiting 0 anyway.")
+        print("=" * 70)
+        return 0
+    print("  Aborting with exit code 1.  (ALLOW_EXTRACT_FAILURES=1 to override)")
+    print("=" * 70)
+    return 1
+
+
 def cmd_decrypt(args):
     print(f"Decrypting bundles from {BUNDLE_DIR}")
     print(f"Output: {args.output}")
@@ -462,6 +489,7 @@ def cmd_decrypt(args):
     )
     if results["decrypted"] > 0:
         print(f"Decrypted bundles: {dec.decrypted_dir}")
+    return _fail_if_any(decrypt=results["failed"])
 
 
 def cmd_decrypt_extract(args):
@@ -512,6 +540,7 @@ def cmd_decrypt_extract(args):
         if count > 0:
             print(f"    {atype}: {count}")
     print(f"\nOutput: {args.output}")
+    return _fail_if_any(decrypt=dec_results["failed"], extract=ext_results["failed"])
 
 
 def cmd_hook_filename(args):
@@ -764,6 +793,7 @@ def cmd_extract_decrypted(args):
     for atype, count in results["assets"].items():
         if count > 0:
             print(f"  {atype}: {count}")
+    return _fail_if_any(extract=results["failed"])
 
 
 def cmd_capture_decrypt(args):
@@ -1011,10 +1041,13 @@ def main():
     p.set_defaults(func=cmd_hook_banner_dates)
     args = parser.parse_args()
     if args.command:
-        args.func(args)
-    else:
-        parser.print_help()
+        # 서브커맨드가 돌려준 값을 그대로 종료 코드로 쓴다. None 은 0 이다.
+        # 예전에는 반환값을 버려서, 번들 복호화가 몇 개 실패해도 종료 코드 0
+        # 이었다 — 파이프라인이 그대로 진행해 templet 이 빠진 채 변환됐다.
+        return args.func(args) or 0
+    parser.print_help()
+    return 2
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -28,7 +28,8 @@ python main.py decrypt
 python main.py decrypt-extract
 
 # Decrypt templets (game data tables) from decrypted bundles
-python decrypt_templets_v2.py
+# --force: 기존 파일도 덮어씀 (게임 업데이트 시 변경된 내용 반영)
+python decrypt_templets_v2.py --force
 
 # Search catalog for keys
 python main.py catalog --search "icon"

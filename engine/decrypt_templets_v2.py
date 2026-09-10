@@ -114,10 +114,14 @@ def decompress_lz4(data: bytes) -> bytes:
         return None
 
 
-def extract_textasset_bytes_from_bundle(bundle_data: bytes) -> list[tuple[str, bytes]]:
+def extract_textasset_bytes_from_bundle(bundle_data: bytes) -> "list[tuple[str, bytes]] | None":
     """
     Extract raw TextAsset name+bytes pairs from a decrypted Unity bundle.
     Uses UnityPy for parsing but reads raw bytes directly.
+
+    번들 자체 파싱이 실패하면 [] 가 아니라 None 을 돌려준다 — [] 는 'TextAsset 이
+    없는 정상 번들' 이라 캐시까지 되지만, None 은 templet 을 통째로 놓친 사고라
+    호출자가 실패로 세야 한다.
     """
     import UnityPy
 
@@ -127,7 +131,7 @@ def extract_textasset_bytes_from_bundle(bundle_data: bytes) -> list[tuple[str, b
     try:
         env = UnityPy.load(io.BytesIO(bundle_data))
     except Exception:
-        return results
+        return None
 
     for obj in env.objects:
         if obj.type.name == "TextAsset":
@@ -247,25 +251,83 @@ def main():
     success = 0
     failed = 0
     skipped_files = 0
+    skipped_bundles = 0
     results = []
     failures = []          # (에셋 이름, 이유) — 마지막에 반드시 보여 준다
 
+    # 번들 단위 캐시. 소스 번들(size+mtime)과 이 스크립트 자체의 mtime 을 기록해
+    # '바뀐 번들만' 다시 복호화한다. 기존의 파일 단위 skip 은 변경 감지가 없어서
+    # --force 를 항상 붙여야 했는데(안 붙이면 STRING_COMMON 이 옛 것으로 남음),
+    # 캐시는 바뀐 번들만 정확히 다시 하므로 force 없이도 항상 최신이다.
+    # --force 는 매니페스트를 무시하고 전부 재처리한다.
+    # 캐시는 templet 디렉토리 밖(output/)에 둔다. 디렉토리 안에 두면 변환기의
+    # list_templet_files() 가 .json 을 전부 templet 으로 오독해 baseline 목록에
+    # 더미 항목이 등재된다.
+    cache_path = out_dir.parent / ".templet_cache.json"
+    legacy_cache = out_dir / ".templet_cache.json"
+    if legacy_cache.exists():
+        try:
+            legacy_cache.unlink()
+        except OSError:
+            pass
+    tool_key = None
+    try:
+        st = Path(__file__).stat()
+        tool_key = f"{st.st_size}:{st.st_mtime_ns}"
+    except OSError:
+        pass
+    cache = {"tool": tool_key, "entries": {}}
+    if not args.force and cache_path.exists():
+        try:
+            with open(cache_path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if loaded.get("tool") == tool_key:
+                cache = loaded
+        except Exception:
+            pass
+
     for i, bundle_path in enumerate(bundle_files):
+        st_key = None
+        try:
+            st = bundle_path.stat()
+            st_key = f"{st.st_size}:{st.st_mtime_ns}"
+        except OSError:
+            pass
+        entry = cache["entries"].get(str(bundle_path))
+        if (
+            not args.force
+            and st_key
+            and entry
+            and entry.get("key") == st_key
+            and all((out_dir / o).exists() for o in entry.get("out", []))
+        ):
+            skipped_bundles += 1
+            skipped_files += entry.get("count", 0)
+            continue
+
         bundle_data = bundle_path.read_bytes()
+        bundle_failed = 0     # 이 번들에서 실패한 수 (파싱 실패 + templet 복호화 실패)
         assets = extract_textasset_bytes_from_bundle(bundle_data)
+        if assets is None:
+            # 번들 자체가 안 풀린다 — 이 번들의 templet 은 전부 빠진다. 실패로
+            # 세서 캐시하지 않는다(다음 실행에 다시 시도·보고된다).
+            failures.append((bundle_path.name, "bundle parse failed (UnityPy.load)"))
+            failed += 1
+            bundle_failed += 1
+            assets = []
+        written = []          # 이 번들이 (다시) 쓴 산출물 — 캐시에 기록
+        count_before = skipped_files
 
         for name, script_data in assets:
             ext = ".json"
             out_path = out_dir / f"{name}{ext}"
 
-            if not args.force and out_path.exists():
-                skipped_files += 1
-                continue
-
             text, method = decrypt_templet(script_data, name)
 
             if text is not None:
-                is_json = text.strip().startswith("{") or text.strip().startswith("[")
+                is_json = text.strip().startswith("{") or text.strip().startswith(
+                    "["
+                )
                 # Also check for UTF-8 BOM
                 if text.startswith("\ufeff"):
                     text = text[1:]
@@ -276,6 +338,7 @@ def main():
                 ext = ".json" if is_json else ".txt"
                 out_path = out_dir / f"{name}{ext}"
                 out_path.write_text(text, encoding="utf-8")
+                written.append(out_path.name)
                 results.append((name, method, len(text), is_json, str(out_path)))
                 success += 1
             elif method.startswith(NOT_TEMPLET):
@@ -284,13 +347,32 @@ def main():
                 # 매직이 맞았으니 templet 인데 복호화가 실패했다. 이건 사고다.
                 failures.append((name, method))
                 failed += 1
+                bundle_failed += 1
+
+        # 실패가 하나라도 있으면 기록하지 않는다 — 다음 실행에 그 번들을 다시
+        # 시도해 실패를 다시 보고한다. 기록해 버리면 FAILED 가 첫 실행에만
+        # 보이고 그 뒤로 종료 코드 1 게이트가 조용히 무력화된다.
+        if st_key and not bundle_failed:
+            cache["entries"][str(bundle_path)] = {
+                "key": st_key,
+                "out": written,
+                "count": skipped_files - count_before,
+            }
 
         if (i + 1) % 20 == 0 or i + 1 == len(bundle_files):
             print(
                 f"  {i + 1}/{len(bundle_files)} bundles ({success} ok, {skipped_files} skipped)"
             )
 
+    if not args.force:
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(cache, f, indent=1)
+        except Exception:
+            pass
+
     print(f"\nDone: {success} decrypted, {skipped_files} skipped, {failed} FAILED")
+    print(f"  (번들 캐시 스킵: {skipped_bundles}/{len(bundle_files)})")
     print(f"Output: {out_dir}")
 
     if results:

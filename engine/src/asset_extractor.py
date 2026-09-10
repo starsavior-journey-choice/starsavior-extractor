@@ -37,13 +37,19 @@ class AssetExtractor:
             print(f"  Failed to parse {bundle_name}: {e}")
         return assets
 
-    def extract_from_file(self, file_path: str) -> list[ExtractedAsset]:
+    def extract_from_file(
+        self, file_path: str, raise_on_error: bool = False
+    ) -> list[ExtractedAsset]:
         assets = []
         try:
             env = UnityPy.load(file_path)
             name = Path(file_path).stem
             assets = self._extract_all(env, name)
         except Exception as e:
+            # raise_on_error 는 병렬 워커용 — 파싱 실패를 '빈 번들' 로 숨기지 않고
+            # 호출자의 예외 처리로 보내 실패로 세어 캐시되지 않게 한다.
+            if raise_on_error:
+                raise
             print(f"  Failed to parse {file_path}: {e}")
         return assets
 

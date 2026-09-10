@@ -2,9 +2,12 @@ import hashlib
 import json
 import numpy as np
 import os
+import shutil
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Optional
 
+from . import asset_extractor
 from .asset_extractor import AssetExtractor
 
 KNOWN_PLAINTEXT = bytes(
@@ -204,6 +207,151 @@ def find_unityfs_offset(data: bytes, max_scan: int = 64) -> int:
     return data[:limit].find(b"UnityFS")
 
 
+class ExtractCache:
+    """소스 파일의 size+mtime 을 기록해 '바뀐 것만 다시 하게' 하는 매니페스트.
+
+    --force(=skip_existing=False) 없이도 항상 최신을 보장하는 게 목적이다.
+    과거 skip_existing 의 문제는 변경 여부를 모르는 채 건너뛰어 STRING_COMMON 이
+    옛 것으로 남는 것이었는데, 소스 해시가 바뀐 번들만 재처리하므로 그 버그가
+    원천 제거된다. 복호화/추출 코드 자체가 바뀌었을 때도 전체 재빌드하도록
+    tool 파일들의 stat 을 매니페스트 헤더에 넣었다.
+    """
+
+    def __init__(self, path, tool_paths=()):
+        self.path = Path(path)
+        self.tool_keys = {str(p): self._stat_key(p) for p in tool_paths}
+        self.data = self._load()
+        self.dirty = False
+
+    @staticmethod
+    def _stat_key(p) -> Optional[str]:
+        try:
+            st = Path(p).stat()
+            return f"{st.st_size}:{st.st_mtime_ns}"
+        except OSError:
+            return None
+
+    def _load(self) -> dict:
+        if self.path.exists():
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    d = json.load(f)
+                if d.get("tools") == self.tool_keys:
+                    return d
+            except Exception:
+                pass
+        # 없거나(첫 실행) 도구 코드가 바뀌었으면 전부 다시 한다.
+        return {"tools": self.tool_keys, "entries": {}}
+
+    def valid(self, src, outputs) -> bool:
+        """src 가 매니페스트 키와 일치하고, 산출물이 실제로 존재할 때만 True."""
+        e = self.data["entries"].get(str(src))
+        if not e:
+            return False
+        if e.get("key") != self._stat_key(Path(src)):
+            return False
+        return all(Path(o).exists() for o in e.get("out", []))
+
+    def record(self, src, outputs):
+        key = self._stat_key(Path(src))
+        if key is None:
+            return
+        self.data["entries"][str(src)] = {
+            "key": key,
+            "out": [str(o) for o in outputs],
+        }
+        self.dirty = True
+
+    def prune(self, live_sources):
+        """더 이상 존재하지 않는 소스의 항목과 산출물을 지운다."""
+        live = {str(s) for s in live_sources}
+        stale = [s for s in self.data["entries"] if s not in live]
+        for s in stale:
+            for o in self.data["entries"][s].get("out", []):
+                p = Path(o)
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                elif p.exists():
+                    p.unlink(missing_ok=True)
+            del self.data["entries"][s]
+        if stale:
+            self.dirty = True
+        return stale
+
+    def save(self):
+        if not self.dirty:
+            return
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, indent=1)
+        self.dirty = False
+
+
+def _extract_out_dirs(output_dir: Path, stem: str) -> list[Path]:
+    """번들 하나의 산출 디렉토리 전부. AssetExtractor 가 쓰는 것과 정확히 일치해야
+    한다 — 캐시 valid() 가 이 디렉토리들의 존재를 검사하고, wipe/기록도 이 기준이다.
+    """
+    return [
+        output_dir / "textures" / stem,
+        output_dir / "sprites" / stem,
+        output_dir / "text_assets" / stem,
+        output_dir / "audio" / stem,
+    ]
+
+
+def _extract_bundle_worker(args):
+    """extract_all_decrypted 의 워커. 번들 단위라 산출 디렉토리(textures/<stem>/ 등)가
+    서로 겹치지 않으므로 프로세스별로 써도 안전하다. 진행 출력은 메인이 모아서 한다.
+    """
+    src, normalized_dir, output_dir, wipe_existing = args
+    src = Path(src)
+    normalized_dir = Path(normalized_dir)
+    output_dir = Path(output_dir)
+    out_dirs = _extract_out_dirs(output_dir, src.stem)
+    try:
+        # 옛 산출물을 먼저 지운다(패치로 이름이 사라진 PNG 등이 남지 않게). 그 뒤
+        # 빈 디렉토리를 만들어 둔다 — 캐시 valid() 가 세 디렉토리의 존재를 요구하는데
+        # AssetExtractor 는 에셋이 있을 때만 디렉토리를 만드므로, 순서가 반대면
+        # 에셋 종류가 하나라도 없는 번들이 매 실행 다시 추출된다.
+        if wipe_existing:
+            for d in out_dirs:
+                if d.is_dir():
+                    shutil.rmtree(d, ignore_errors=True)
+        for d in out_dirs:
+            d.mkdir(parents=True, exist_ok=True)
+        with open(src, "rb") as f:
+            data = f.read()
+        offset = find_unityfs_offset(data)
+        if offset < 0:
+            return (src.name, "failed", {}, "UnityFS header not found near start")
+        normalized = data[offset:]
+        if not verify_decrypted_header(normalized):
+            return (src.name, "failed", {}, "bad UnityFS header after trim")
+        dst = normalized_dir / f"{src.stem}.bundle"
+        if not dst.exists() or dst.stat().st_size != len(normalized):
+            with open(dst, "wb") as f:
+                f.write(normalized)
+
+        import warnings
+
+        from UnityPy.exceptions import UnityVersionFallbackWarning
+
+        # 순차 버전과 마찬가지로 버전 폴백 경고는 잡는다. 안 잡으면 워커마다
+        # stderr 로 쏟아져 진행 출력만 방해된다. raise_on_error — 파싱 실패를
+        # '빈 번들' 로 캐시하지 않고 실패로 세려고 예외로 받는다.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UnityVersionFallbackWarning)
+            assets = AssetExtractor(str(output_dir)).extract_from_file(
+                str(dst), raise_on_error=True
+            )
+        counts = {}
+        for a in assets:
+            counts[a.asset_type] = counts.get(a.asset_type, 0) + 1
+        status = "extracted" if assets else "empty"
+        return (src.name, status, counts, "")
+    except Exception as e:
+        return (src.name, "failed", {}, str(e))
+
+
 class BundleDecryptor:
     def __init__(
         self, bundle_dir: str, output_dir: str, decrypted_dir: Optional[str] = None
@@ -272,11 +420,17 @@ class BundleDecryptor:
         total = len(files)
         r = {"decrypted": 0, "skipped": 0, "failed": 0, "bitblended": 0, "total": total}
         has_masks = len(self.mask_map) > 0
+        # skip_existing=True 는 '캐시로 스킵'(소스가 안 바뀌었고 산출물이 있으면).
+        # False(--force) 는 매니페스트를 무시하고 전부 재처리한다.
+        cache = ExtractCache(
+            self.output_dir / ".decrypt_cache.json",
+            tool_paths=[Path(__file__).resolve()],
+        )
         for i, p in enumerate(files):
             if progress_cb:
                 progress_cb(i, total, p.name)
             dst = self.decrypted_dir / p.name
-            if skip_existing and dst.exists():
+            if skip_existing and cache.valid(p, [dst]):
                 r["skipped"] += 1
                 continue
             try:
@@ -285,25 +439,49 @@ class BundleDecryptor:
                     mask = parse_mask_hex(self.mask_map[p.name])
                     r["bitblended"] += 1
                 decrypt_file(str(p), str(dst), mask)
+                # 이미 평문이었던 소스는 dst 를 쓰지 않고 끝난다. 그런 항목을
+                # 기록하면 valid() 를 영영 통과 못 하는 유령 항목만 남는다.
+                if dst.exists():
+                    cache.record(p, [dst])
                 r["decrypted"] += 1
             except Exception as e:
                 print(f"\n  [FAIL] {p.name}: {e}")
                 r["failed"] += 1
+        if not files:
+            # 소스가 하나도 없으면 게임 경로가 틀렸을 가능이 높다. 여기서 prune
+            # 하면 정상적인 산출물을 전부 지우므로 아무것도 하지 않는다.
+            return r
+        stale = cache.prune(files) if skip_existing else []
+        if stale:
+            print(f"  [CACHE] 소스가 사라진 산출물 {len(stale)}개 정리")
+        cache.save()
         return r
 
     def extract_all_decrypted(
-        self, skip_existing: bool = True, progress_cb=None
+        self,
+        skip_existing: bool = True,
+        progress_cb=None,
+        workers: int = 0,
     ) -> dict:
-        import warnings
-        from UnityPy.exceptions import UnityVersionFallbackWarning
+        total_files = self.iter_decrypted_files()
+        # skip_existing=True 는 '캐시로 스킵'. False(--force) 는 전부 재처리.
+        # tool_paths 에 asset_extractor 도 넣는다 — 실제 추출 로직이 거기 있으므로
+        # 그 코드를 고치면 캐시가 무효화돼야 옛 산출물이 남지 않는다.
+        cache = ExtractCache(
+            self.output_dir / ".extract_cache.json",
+            tool_paths=[
+                Path(__file__).resolve(),
+                Path(asset_extractor.__file__),
+            ],
+        )
 
-        files = self.iter_decrypted_files()
-        total = len(files)
+        # 작업 목록: (재처리 대상, 존재하는 옛 산출물을 지워야 하는지)
+        jobs = []
         r = {
             "extracted": 0,
             "skipped": 0,
             "failed": 0,
-            "total": total,
+            "total": len(total_files),
             "assets": {
                 "Texture2D": 0,
                 "Sprite": 0,
@@ -312,34 +490,67 @@ class BundleDecryptor:
                 "other": 0,
             },
         }
-        for i, p in enumerate(files):
-            if progress_cb:
-                progress_cb(i, total, p.name)
-            stem = p.stem
-            out_dirs = [
-                self.output_dir / "textures" / stem,
-                self.output_dir / "sprites" / stem,
-                self.output_dir / "text_assets" / stem,
-            ]
-            if skip_existing and any(d.exists() for d in out_dirs):
+        for p in total_files:
+            out_dirs = _extract_out_dirs(self.output_dir, p.stem)
+            if skip_existing and cache.valid(p, out_dirs):
                 r["skipped"] += 1
                 continue
-            try:
-                prepared_path, offset = self.prepare_bundle_for_extraction(p)
-                if prepared_path is None:
-                    print(f"  Skipping {p.name}: UnityFS header not found near start")
-                    r["failed"] += 1
-                    continue
-                if offset > 0:
-                    print(f"  Normalized {p.name}: trimmed {offset} leading bytes")
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", UnityVersionFallbackWarning)
-                    assets = self.asset_extractor.extract_from_file(str(prepared_path))
-                for a in assets:
-                    t = a.asset_type
-                    r["assets"][t] = r["assets"].get(t, 0) + 1
-                if assets:
-                    r["extracted"] += 1
-            except Exception:
+            # 소스가 바뀐 번들은 옛 산출물(이름이 사라진 PNG 등)이 남지 않게 지운다.
+            wipe = any(d.exists() for d in out_dirs)
+            jobs.append((p, wipe))
+
+        if not total_files:
+            # decrypted 디렉토리가 비었다 — 경로가 틀렸을 가능이 높다. prune 하면
+            # 정상적인 산출물을 전부 지우므로 아무것도 하지 않는다.
+            return r
+
+        total = len(jobs)
+        if jobs:
+            workers = workers or int(os.environ.get("EXTRACT_WORKERS", "0")) or min(
+                8, (os.cpu_count() or 4)
+            )
+            workers = max(1, min(workers, total))
+        done_count = [0]
+
+        def tick(name, status, counts, msg):
+            done_count[0] += 1
+            if status == "failed":
+                print(f"\n  [FAIL] {name}: {msg}")
                 r["failed"] += 1
+            elif status == "extracted":
+                r["extracted"] += 1
+                for t, c in counts.items():
+                    r["assets"][t] = r["assets"].get(t, 0) + c
+            if progress_cb:
+                progress_cb(done_count[0] - 1, total, name)
+
+        # jobs 가 비어도(전부 캐시 히트) 아래 prune 은 돌려야 한다 — 소스가 사라진
+        # 항목 정리는 캐시 히트와 무관하다.
+        if not jobs:
+            pass
+        elif workers > 1:
+            # 프로세스 풀. Worker 안에서 AssetExtractor 를 새로 만드므로 상태 공유 없음.
+            args_iter = (
+                (src, self.normalized_dir, self.output_dir, wipe) for src, wipe in jobs
+            )
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                for src, (name, status, counts, msg) in zip(
+                    (s for s, _ in jobs), pool.map(_extract_bundle_worker, args_iter, chunksize=4)
+                ):
+                    if status != "failed":
+                        cache.record(src, _extract_out_dirs(self.output_dir, src.stem))
+                    tick(name, status, counts, msg)
+        else:
+            for src, wipe in jobs:
+                name, status, counts, msg = _extract_bundle_worker(
+                    (src, self.normalized_dir, self.output_dir, wipe)
+                )
+                if status != "failed":
+                    cache.record(src, _extract_out_dirs(self.output_dir, src.stem))
+                tick(name, status, counts, msg)
+
+        stale = cache.prune(total_files) if skip_existing else []
+        if stale:
+            print(f"  [CACHE] 소스가 사라진 산출물 {len(stale)}개 정리")
+        cache.save()
         return r

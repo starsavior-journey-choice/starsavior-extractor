@@ -1,4 +1,5 @@
 import frida
+import os
 import sys
 import time
 import json
@@ -13,7 +14,12 @@ from .asset_extractor import AssetExtractor
 
 
 GAME_PROCESS_NAME = "StarSavior.exe"
-GAME_DATA_DIR = r"/mnt/c/Program Files (x86)/Steam/steamapps/common/StarSavior/Data"
+# SS_GAME_DATA_DIR 이 있으면 그것을 쓴다 — run.sh 가 플랫폼(WSL/Windows)별로 넣어준다.
+# 기본값은 기존과 같은 WSL 경로라, 환경변수 없는 기존 워크플로는 그대로다.
+GAME_DATA_DIR = (
+    os.environ.get("SS_GAME_DATA_DIR")
+    or r"/mnt/c/Program Files (x86)/Steam/steamapps/common/StarSavior/Data"
+)
 BUNDLE_DIR = str(Path(GAME_DATA_DIR) / "eb")
 CATALOG_PATH = str(Path(GAME_DATA_DIR) / "StreamingAssets" / "aa" / "catalog.json")
 DEFAULT_OUTPUT_DIR = r"D:\starsavior-extractor\output"

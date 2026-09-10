@@ -517,7 +517,7 @@ def cmd_decrypt_extract(args):
     )
     print(f"\n  Decrypted in {time.time() - dec_t0:.1f}s")
 
-    print("\n--- Phase 2: Extracting (skipping bundles with compressed blocks) ---")
+    print("\n--- Phase 2: Extracting (해시 캐시로 바뀐 번들만, 병렬 처리) ---")
     ext_t0 = time.time()
     ext_results = dec.extract_all_decrypted(
         skip_existing=not args.force,
@@ -526,6 +526,7 @@ def cmd_decrypt_extract(args):
             if (i + 1) % 100 == 0 or i + 1 == total
             else None
         ),
+        workers=getattr(args, "workers", 0),
     )
     print(f"\n  Extracted in {time.time() - ext_t0:.1f}s")
 
@@ -999,6 +1000,12 @@ def main():
     p.add_argument("--output", default=DEFAULT_OUTPUT)
     p.add_argument("--decrypted-dir", default=None)
     p.add_argument("--force", action="store_true")
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="병렬 추출 워커 수. 0 = EXTRACT_WORKERS 환경변수, 없으면 CPU 수(최대 8)",
+    )
     p.set_defaults(func=cmd_decrypt_extract)
     p = sub.add_parser(
         "extract-decrypted", help="Extract from already-decrypted bundles"

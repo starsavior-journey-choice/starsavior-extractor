@@ -10,6 +10,8 @@ import io
 import json
 import struct
 import hashlib
+import gzip
+import shutil
 import lz4.frame
 import lz4.block
 from pathlib import Path
@@ -211,6 +213,167 @@ def decrypt_templet(data: bytes, filename: str) -> tuple[str | None, str]:
         return None, f"unknown version byte: {version_byte}"
 
 
+def _strip_trailing_commas(text: str) -> str:
+    """Remove trailing commas outside strings (STRING_COMMON uses JSONC commas)."""
+    out = []
+    in_string = False
+    escaped = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == ",":
+            j = i + 1
+            while j < len(text) and text[j].isspace():
+                j += 1
+            if j < len(text) and text[j] in "]}":
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _load_json_text(text: str):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return json.loads(_strip_trailing_commas(text))
+
+
+def merge_candidate_templets(out_dir: Path, candidates_dir: Path) -> int:
+    """Write one deterministic output per TextAsset name.
+
+    Unity bundles can contain different, overlapping copies of the same templet.
+    Use the most complete copy as the row source, then add rows absent from it.
+    Rows sharing a stable ID are one logical row even when ignored/default fields
+    differ between bundle copies. Candidate files are gzip-compressed outside
+    decrypted_templets so the converter still sees only the merged files.
+    """
+    grouped = {}
+    for bundle_dir in sorted(p for p in candidates_dir.iterdir() if p.is_dir()):
+        for candidate in sorted(bundle_dir.glob("*.gz")):
+            asset_name = candidate.name[:-3]  # drop .gz, retain .json/.txt
+            grouped.setdefault(asset_name, []).append(candidate)
+
+    merged_count = 0
+    for asset_name, files in sorted(grouped.items()):
+        decoded = []
+        for path in files:
+            with gzip.open(path, "rt", encoding="utf-8") as f:
+                text = f.read()
+            decoded.append((path, text))
+
+        # Non-templet TextAssets retain the existing deterministic last-copy rule.
+        # Data-table JSONs are merged by exact row identity, preserving variant-only
+        # rows and avoiding duplicate identical rows.
+        docs = []
+        for path, text in decoded:
+            try:
+                doc = _load_json_text(text) if asset_name.endswith(".json") else None
+            except (json.JSONDecodeError, TypeError):
+                doc = None
+            docs.append((path, text, doc))
+
+        data_docs = [(path, text, doc) for path, text, doc in docs
+                     if isinstance(doc, dict) and isinstance(doc.get("Data"), list)]
+        if data_docs:
+            # Prefer the copy with the most rows. Smaller copies are often older
+            # or partial bundle variants; using them as the base can discard newer
+            # values when the same row ID appears in several bundles.
+            data_docs.sort(key=lambda item: (-len(item[2]["Data"]), str(item[0])))
+            base = data_docs[0][2]
+            rows = list(base["Data"])
+
+            # Infer a row key only when it is present, non-null, and unique in
+            # every copy. Template schemas vary, but stable ID fields consistently
+            # end in Id/ID; prefer plain numeric IDs over string IDs.
+            common_fields = None
+            for _path, _text, doc in data_docs:
+                doc_fields = set.intersection(*(
+                    set(row) for row in doc["Data"] if isinstance(row, dict)
+                )) if doc["Data"] and all(isinstance(row, dict) for row in doc["Data"]) else set()
+                common_fields = doc_fields if common_fields is None else common_fields & doc_fields
+
+            def id_field_rank(field):
+                if field in ("id", "Id", "ID"):
+                    return (0, field)
+                if field.endswith("StrID") or field.endswith("StrId"):
+                    return (20, field)
+                if field.endswith("ID"):
+                    return (10, field)
+                if field.endswith("Id"):
+                    return (15, field)
+                return (100, field)
+
+            key_fields = sorted(
+                (field for field in (common_fields or set())
+                 if field in ("id", "Id", "ID") or field.endswith(("Id", "ID"))),
+                key=id_field_rank,
+            )
+            row_key_field = None
+            for field in key_fields:
+                valid = True
+                for _path, _text, doc in data_docs:
+                    values = [row.get(field) for row in doc["Data"]]
+                    if (any(value is None or isinstance(value, (dict, list)) for value in values)
+                            or len(values) != len(set(json.dumps(value, sort_keys=True) for value in values))):
+                        valid = False
+                        break
+                if valid:
+                    row_key_field = field
+                    break
+
+            if row_key_field:
+                seen = {json.dumps(row[row_key_field], ensure_ascii=False, sort_keys=True)
+                        for row in rows}
+                # Base rows win for conflicting IDs; only truly new IDs are added.
+                for _path, _text, doc in data_docs[1:]:
+                    for row in doc["Data"]:
+                        identity = json.dumps(row[row_key_field], ensure_ascii=False,
+                                              sort_keys=True)
+                        if identity not in seen:
+                            seen.add(identity)
+                            rows.append(row)
+            else:
+                # For tables without a safe unique ID, retain the prior exact-row
+                # union behavior rather than collapsing potentially distinct rows.
+                seen = {json.dumps(row, ensure_ascii=False, sort_keys=True,
+                                   separators=(",", ":")) for row in rows}
+                for _path, _text, doc in data_docs[1:]:
+                    for row in doc["Data"]:
+                        identity = json.dumps(row, ensure_ascii=False, sort_keys=True,
+                                              separators=(",", ":"))
+                        if identity not in seen:
+                            seen.add(identity)
+                            rows.append(row)
+            base["Data"] = rows
+            output_text = json.dumps(base, ensure_ascii=False, indent=1) + "\n"
+            merged_count += 1
+        else:
+            output_text = decoded[-1][1]
+
+        out_path = out_dir / asset_name
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(output_text, encoding="utf-8")
+
+    return merged_count
+
+
 def main():
     import argparse
 
@@ -237,6 +400,8 @@ def main():
     args = parser.parse_args()
 
     out_dir = Path(args.output) if args.output else OUTPUT_DIR
+    candidates_dir = out_dir.parent / "templet_candidates"
+    candidates_dir.mkdir(parents=True, exist_ok=True)
 
     if args.name:
         bundle_files = [DECRYPTED_BUNDLES_DIR / f"{args.name}.bundle"]
@@ -315,13 +480,14 @@ def main():
             failed += 1
             bundle_failed += 1
             assets = []
-        written = []          # 이 번들이 (다시) 쓴 산출물 — 캐시에 기록
+        written = []          # 이 번들의 후보 파일 — 캐시에 기록
         count_before = skipped_files
+        bundle_candidates = candidates_dir / bundle_path.stem
+        if bundle_candidates.exists():
+            shutil.rmtree(bundle_candidates)
+        bundle_candidates.mkdir(parents=True, exist_ok=True)
 
         for name, script_data in assets:
-            ext = ".json"
-            out_path = out_dir / f"{name}{ext}"
-
             text, method = decrypt_templet(script_data, name)
 
             if text is not None:
@@ -336,10 +502,18 @@ def main():
                     )
 
                 ext = ".json" if is_json else ".txt"
-                out_path = out_dir / f"{name}{ext}"
-                out_path.write_text(text, encoding="utf-8")
-                written.append(out_path.name)
-                results.append((name, method, len(text), is_json, str(out_path)))
+                if Path(name).name != name or name in ("", ".", ".."):
+                    failures.append((name, "unsafe TextAsset name"))
+                    failed += 1
+                    bundle_failed += 1
+                    continue
+                candidate_path = bundle_candidates / f"{name}{ext}.gz"
+                with gzip.open(candidate_path, "wt", encoding="utf-8") as f:
+                    f.write(text)
+                relative_candidate = os.path.relpath(candidate_path, out_dir)
+                written.append(relative_candidate)
+                results.append((name, method, len(text), is_json,
+                                str(out_dir / f"{name}{ext}")))
                 success += 1
             elif method.startswith(NOT_TEMPLET):
                 skipped_files += 1          # templet 이 아닌 에셋 — 정상
@@ -371,8 +545,18 @@ def main():
         except Exception:
             pass
 
+    # A deleted bundle must not keep contributing rows from an old candidate.
+    if not args.name and args.limit == 0:
+        live_stems = {p.stem for p in bundle_files}
+        for bundle_dir in candidates_dir.iterdir():
+            if bundle_dir.is_dir() and bundle_dir.name not in live_stems:
+                shutil.rmtree(bundle_dir)
+
+    merged = merge_candidate_templets(out_dir, candidates_dir)
+
     print(f"\nDone: {success} decrypted, {skipped_files} skipped, {failed} FAILED")
     print(f"  (번들 캐시 스킵: {skipped_bundles}/{len(bundle_files)})")
+    print(f"  (중복 사본을 합친 템플릿: {merged})")
     print(f"Output: {out_dir}")
 
     if results:
